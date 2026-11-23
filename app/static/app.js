@@ -74,6 +74,10 @@ function render() {
     gate.className = "badge warn";
   }
 
+  const fsyncBadge = $("fsync-badge");
+  fsyncBadge.textContent = `累计 fsync: ${state.fsync_total ?? 0}`;
+  fsyncBadge.className = "badge ok";
+
   const slot = $("slot-info");
   if (state.mounted) {
     slot.innerHTML =
@@ -185,15 +189,16 @@ async function doRead() {
 async function doWrite() {
   const block = Number($("block-num").value);
   const delay = Number($("write-delay").value) || 0;
+  const syncDelay = Number($("write-sync-delay").value) || 0;
   const payload = toFixedPayload($("write-payload").value);
   try {
     const data = await api(`/api/blocks/${block}/write`, {
-      body: { payload, delay, note: "网页手动写入" },
+      body: { payload, delay, sync_delay: syncDelay, note: "网页手动写入" },
     });
     if (data.result.queued) {
       toast(`写入已排队（门处于暂停），代次 ${data.result.write.mount_generation}`, "info");
     } else if (data.result.write.status === "done") {
-      toast("落盘成功", "success");
+      toast(`落盘成功（批次 ${data.result.write.batch_id || "-"}）`, "success");
     }
   } catch (e) {
     toast(`写入未成功：${e.message}`, "error", 7000);
@@ -234,22 +239,41 @@ async function doConcurrent() {
   if (ba === bb) { toast("并发测试请选择两个不同的块号", "error"); return; }
   const pa = toFixedPayload($("cc-payload-a").value);
   const pb = toFixedPayload($("cc-payload-b").value);
+  const syncDelay = Number($("cc-sync-delay").value) || 0;
   $("cc-result").innerHTML = '<span class="hint">两个请求已同时发出，等待结果…</span>';
+
+  // 记录发起前的累计 fsync 次数，结束后核对两条写入实际用了几次同步
+  const fsyncBefore = state.fsync_total ?? 0;
   const started = Date.now();
   const [ra, rb] = await Promise.allSettled([
-    api(`/api/blocks/${ba}/write`, { body: { payload: pa, note: "并发-A" } }),
-    api(`/api/blocks/${bb}/write`, { body: { payload: pb, note: "并发-B" } }),
+    api(`/api/blocks/${ba}/write`, { body: { payload: pa, sync_delay: syncDelay, note: "并发-A" } }),
+    api(`/api/blocks/${bb}/write`, { body: { payload: pb, sync_delay: syncDelay, note: "并发-B" } }),
   ]);
   const elapsed = Date.now() - started;
   const lines = [`<div>耗时 ${elapsed}ms</div>`];
+  const fulfilled = [];
   for (const [tag, r] of [["A", ra], ["B", rb]]) {
     if (r.status === "fulfilled") {
-      lines.push(`<div>写入${tag}: <span class="pill done">成功</span> 状态=${r.value.result.write.status}</div>`);
+      const w = r.value.result.write;
+      fulfilled.push(w);
+      lines.push(`<div>写入${tag}: <span class="pill done">成功</span> 状态=${w.status}，批次=<code>${w.batch_id || "-"}</code></div>`);
     } else {
       lines.push(`<div>写入${tag}: <span class="pill failed">报错</span> ${r.reason.message}</div>`);
     }
   }
-  // 立刻回读两个块验证改动都保留
+  // 合批核对：两条成功写入若批次号相同，则合用了一次 fsync
+  if (fulfilled.length === 2) {
+    const sameBatch = fulfilled[0].batch_id && fulfilled[0].batch_id === fulfilled[1].batch_id;
+    lines.push(
+      sameBatch
+        ? `<div>两条写入同属批次 <code>${fulfilled[0].batch_id}</code>：<b style="color:#6ee7b7">合用 1 次 fsync</b></div>`
+        : `<div>两条写入分属不同批次（<code>${fulfilled[0].batch_id}</code> / <code>${fulfilled[1].batch_id}</code>）：各用 1 次 fsync，共 2 次</div>`,
+    );
+  }
+  const fsyncAfter = state.fsync_total ?? 0;
+  lines.push(`<div>本次并发实际新增同步次数：<b>${fsyncAfter - fsyncBefore}</b>（累计 ${fsyncBefore} → ${fsyncAfter}）</div>`);
+
+  // 同步成功后才回读两个块，验证改动都保留（块锁保证回读发生在 fsync 之后）
   try {
     const [va, vb] = await Promise.all([
       api(`/api/blocks/${ba}`, { method: "GET" }),

@@ -9,8 +9,28 @@
   因此换盘后再放行的旧写入一律拒绝，即使把原盘插回也不会改动任何镜像。
 * 写入门(open/paused)控制写入是直接落盘还是先进入 pending 队列。暂停期间仍可
   换盘、读盘，并对“当前挂载的盘”发起新写入(同样进入队列)。
-* 每个块有独立锁，不同块的写入可以真正并行；同一把块锁保证同块写入串行、
-  落盘的整块写入不会撕裂。
+* 每个(盘, 块)有独立锁，不同块的写入可以真正并行；同一把块锁保证同块写入串行、
+  落盘的整块写入不会撕裂。注意块锁按 **(盘ID, 块号)** 区分：旧盘的批次正在等
+  同步时，换上新盘后对同号块的读写使用另一把锁，不会被旧盘同步阻塞。
+
+合批同步(一次 fsync 覆盖多块)
+-----------------------------
+门放行后的直接写入(以及排队放行的写入)在通过失效/故障预检、拿到自己的块锁后，
+进入一个按 **(盘ID, 挂载代次)** 归属的同步批次：
+
+* 第一个到达的写入作为批次“值班员(leader)”建批，并留出一个很短的合流窗口
+  (``BATCH_JOIN_WINDOW``，默认 25ms)；同盘、同挂载代次、写**不同块**的就绪
+  写入在窗口内并入同一批次。同一块的写入因块锁互斥，只会进入后续批次。
+* 合流窗口关闭后，leader 依次 ``seek/write`` 批次内各块，随后只调用 **一次**
+  ``flush + fsync``；批次内其它写入在自己的块锁上等待同步结束。
+* 批次成员(含 leader)都要等同步成功后才把状态置为 ``done`` 并返回；参与批次的
+  块因块锁一直 held 到同步结束，期间的回读会自然阻塞到同步完成，不会读到
+  “已 write 尚未 fsync”的中间视图。
+* 即使只有一条写入也照常建批落盘(单成员批次 = 一次 fsync，行为与改造前等价)。
+* 批次一旦开始就只针对它所属的那份镜像：等待同步期间换盘，批次仍在原盘完成；
+  旧挂载代次的其它写入在预检处判定 ``stale``，不会混进新盘的批次。
+* 故障开关在真正动盘(open/write)之前检查：开关打开时，尚未动盘的批次整批
+  报 :class:`SimulatedFlushError`，所有成员的原块内容保持不变。
 """
 
 from __future__ import annotations
@@ -21,7 +41,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 BLOCK_SIZE = 64
 BLOCK_COUNT = 32
@@ -63,6 +83,8 @@ class PendingWrite:
     note: str = ""
     status: str = "pending"  # pending / done / stale / failed
     error: str = ""
+    sync_delay: float = 0.0   # 批次 fsync 前的额外睡眠（演练“同步中换盘”）
+    batch_id: str = ""        # 实际归属的同步批次
 
     def to_dict(self) -> dict:
         return {
@@ -73,11 +95,34 @@ class PendingWrite:
             "payload": self.payload.decode("latin-1"),
             "mount_generation": self.mount_generation,
             "delay": self.delay,
+            "sync_delay": self.sync_delay,
+            "batch_id": self.batch_id,
             "created_at": self.created_at,
             "note": self.note,
             "status": self.status,
             "error": self.error,
         }
+
+
+@dataclass
+class SyncBatch:
+    """一次合批同步：同盘同代次、不同块的若干写入共用一次 fsync。"""
+
+    batch_id: str
+    disk_id: str
+    disk_name: str
+    mount_generation: int
+    members: List[PendingWrite]
+    joined_blocks: Set[int]
+    event: threading.Event
+    sync_delay: float = 0.0
+    success: bool = False
+    fsync_index: int = 0          # 本批次使用的是全局第几次 fsync（1 起）
+    error: Optional[Exception] = None
+
+    @property
+    def size(self) -> int:
+        return len(self.members)
 
 
 def _seed_block_content(disk_name: str, block: int) -> bytes:
@@ -88,13 +133,18 @@ def _seed_block_content(disk_name: str, block: int) -> bytes:
 class DiskManager:
     def __init__(self, data_dir: str):
         self.data_dir = data_dir
-        os.makedirs(self.data_dir, exist_ok=True)
-        self.meta_path = os.path.join(self.data_dir, META_FILENAME)
+        os.makedirs(data_dir, exist_ok=True)
+        self.meta_path = os.path.join(data_dir, META_FILENAME)
 
-        self._lock = threading.RLock()           # 保护槽位/队列/元数据
-        self._block_locks: Dict[int, threading.Lock] = {
-            i: threading.Lock() for i in range(BLOCK_COUNT)
-        }
+        self._lock = threading.RLock()           # 保护槽位/队列/元数据/计数
+        # 块锁按 (盘ID, 块号) 区分：换盘后新盘同号块不被旧盘同步阻塞
+        self._block_locks_guard = threading.Lock()
+        self._block_locks: Dict[Tuple[str, int], threading.Lock] = {}
+
+        # 合批协调：同一时刻每个 (盘, 代次) 最多一个开放批次
+        self._batch_cond = threading.Condition()
+        self._open_batch: Optional[SyncBatch] = None
+
         self.disks: Dict[str, DiskInfo] = {}
         self.mounted_id: Optional[str] = None
         self.mount_generation = 0
@@ -103,6 +153,13 @@ class DiskManager:
         self.pending: Dict[str, PendingWrite] = {}
         self.event_log: List[dict] = []
         self._log_max = 200
+
+        # 实际 fsync 次数统计与近期批次摘要（供页面/测试核对合批效果）
+        self.fsync_total = 0
+        self.batch_history: List[dict] = []
+        self._batch_history_max = 50
+        # 合流窗口：leader 建批后等待其它就绪写入并入的时间
+        self.batch_join_window = float(os.environ.get("BATCH_JOIN_WINDOW", "0.025"))
 
         self._load_or_seed()
 
@@ -146,10 +203,12 @@ class DiskManager:
             self.pending.clear()
             self.gate_open = True
             self.fail_simulation = False
+            self.fsync_total = 0
+            self.batch_history.clear()
             first = sorted(self.disks.values(), key=lambda d: d.filename)[0]
             self.mounted_id = first.disk_id
             self.mount_generation = 1
-            self._log("reseed", "两份镜像已重新生成，槽位与写入门已重置")
+            self._log("reseed", "两份镜像已重新生成，槽位、写入门与同步计数已重置")
 
     def _write_meta(self) -> None:
         tmp = self.meta_path + ".tmp"
@@ -171,6 +230,24 @@ class DiskManager:
         if len(self.event_log) > self._log_max:
             del self.event_log[: len(self.event_log) - self._log_max]
 
+    def _record_batch(self, batch: SyncBatch, status: str, error: str) -> None:
+        self.batch_history.append(
+            {
+                "batch_id": batch.batch_id,
+                "disk_id": batch.disk_id,
+                "disk_name": batch.disk_name,
+                "mount_generation": batch.mount_generation,
+                "blocks": [m.block for m in batch.members],
+                "size": batch.size,
+                "status": status,
+                "error": error,
+                "fsync_index": batch.fsync_index,
+                "ts": time.time(),
+            }
+        )
+        if len(self.batch_history) > self._batch_history_max:
+            del self.batch_history[: len(self.batch_history) - self._batch_history_max]
+
     # ------------------------------------------------------------------ 快照
     def snapshot(self) -> dict:
         with self._lock:
@@ -185,6 +262,8 @@ class DiskManager:
                 "disks": [d.to_dict() for d in self.disks.values()],
                 "pending": [w.to_dict() for w in self.pending.values()],
                 "event_log": list(reversed(self.event_log)),
+                "fsync_total": self.fsync_total,
+                "batches": list(reversed(self.batch_history)),
             }
 
     # ------------------------------------------------------------------ 槽位
@@ -200,7 +279,8 @@ class DiskManager:
             self._log(
                 "plug",
                 f"挂载 {info.name}，挂载代次推进到 {self.mount_generation}；"
-                f"此前排队的旧写入若代次不符将在放行时失效",
+                f"此前排队的旧写入若代次不符将在放行时失效；"
+                f"已在原盘开跑的同步批次仍只在原盘完成",
             )
             return {"mount_generation": self.mount_generation, "mounted": info.to_dict()}
 
@@ -241,13 +321,24 @@ class DiskManager:
             raise DiskError("槽位未挂载任何盘，无法读写")
         return self.disks[self.mounted_id]
 
+    def _block_lock(self, disk_id: str, block: int) -> threading.Lock:
+        """按 (盘ID, 块号) 取锁：不同盘的同号块互不阻塞。"""
+        key = (disk_id, block)
+        with self._block_locks_guard:
+            lock = self._block_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._block_locks[key] = lock
+            return lock
+
     # ------------------------------------------------------------------ 读
     def read_block(self, block: int) -> dict:
         with self._lock:
             info = self._require_mounted()
             self._validate(block, b"x" * BLOCK_SIZE)  # 只校验块号
-        # 读也拿块锁，保证不会读到正在写一半的块
-        with self._block_locks[block]:
+        # 读也拿(盘,块)锁，保证不会读到正在写一半/尚未同步完的块；
+        # 换盘后读新盘同号块用的是另一把锁，旧盘同步不会挡住它。
+        with self._block_lock(info.disk_id, block):
             with open(self._path_for(info), "rb") as fh:
                 fh.seek(block * BLOCK_SIZE)
                 data = fh.read(BLOCK_SIZE)
@@ -267,41 +358,33 @@ class DiskManager:
         payload: bytes,
         delay: float = 0.0,
         note: str = "",
+        sync_delay: float = 0.0,
     ) -> dict:
         """对当前挂载盘发起定长块写入。
 
         门放行时直接落盘；门暂停时入队等待。慢写(delay>0)在落盘前睡眠，
-        以便演练“写入尚未落盘时暂停/换盘”。
+        以便演练“写入尚未落盘时暂停/换盘”。``sync_delay`` 让所属批次在
+        真正 ``fsync`` 前再睡一会，便于演练“同步进行中换盘”。
         """
         delay = max(0.0, float(delay))
+        sync_delay = max(0.0, float(sync_delay))
         with self._lock:
             info = self._require_mounted()
             self._validate(block, payload)
             generation = self.mount_generation
-            if self.gate_open:
-                pw = PendingWrite(
-                    id=uuid.uuid4().hex[:12],
-                    disk_id=info.disk_id,
-                    disk_name=info.name,
-                    block=block,
-                    payload=bytes(payload),
-                    mount_generation=generation,
-                    delay=delay,
-                    created_at=time.time(),
-                    note=note or "直接写入",
-                )
-            else:
-                pw = PendingWrite(
-                    id=uuid.uuid4().hex[:12],
-                    disk_id=info.disk_id,
-                    disk_name=info.name,
-                    block=block,
-                    payload=bytes(payload),
-                    mount_generation=generation,
-                    delay=delay,
-                    created_at=time.time(),
-                    note=note or "暂停期间排队",
-                )
+            pw = PendingWrite(
+                id=uuid.uuid4().hex[:12],
+                disk_id=info.disk_id,
+                disk_name=info.name,
+                block=block,
+                payload=bytes(payload),
+                mount_generation=generation,
+                delay=delay,
+                sync_delay=sync_delay,
+                created_at=time.time(),
+                note=note or ("直接写入" if self.gate_open else "暂停期间排队"),
+            )
+            if not self.gate_open:
                 self.pending[pw.id] = pw
                 self._log(
                     "enqueue",
@@ -309,7 +392,7 @@ class DiskManager:
                 )
                 return {"queued": True, "write": pw.to_dict()}
 
-        # 门放行：直接落盘（块锁内完成）
+        # 门放行：直接落盘（块锁 + 合批同步）
         self._flush(pw)
         return {"queued": False, "write": pw.to_dict()}
 
@@ -355,11 +438,12 @@ class DiskManager:
                 self.pending.pop(pw.id, None)
         return {"write": pw.to_dict()}
 
-    def _flush(self, pw: PendingWrite) -> None:
-        """真正落盘的唯一入口，包含慢写睡眠、失效判定与失败模拟。"""
-        if pw.delay:
-            time.sleep(pw.delay)
+    # ------------------------------------------------------ 失效/故障预检
+    def _precheck(self, pw: PendingWrite) -> DiskInfo:
+        """动盘之前的判定：失效(stale)优先，其次模拟落盘失败。
 
+        在拿块锁之前调用，避免慢写/换盘场景下无谓地占用块锁。
+        """
         with self._lock:
             current_info = self.disks.get(self.mounted_id) if self.mounted_id else None
             current_generation = self.mount_generation
@@ -378,22 +462,163 @@ class DiskManager:
                 self._log("stale", f"写入失效: {pw.disk_name} 块{pw.block}，未改动任何镜像")
             raise StaleWriteError(pw.error)
 
-        # 2) 模拟落盘失败：在真正写文件之前抛错，原块内容完整保留
-        if fail:
-            pw.status = "failed"
-            pw.error = "模拟落盘失败：写入门已拒绝本次写入，镜像未被修改"
-            with self._lock:
-                self._log("flush-fail", f"模拟落盘失败: {pw.disk_name} 块{pw.block}，原块内容保留")
-            raise SimulatedFlushError(pw.error)
-
         if not current_info:
             pw.status = "stale"
             pw.error = "写入失效：槽位当前为空"
             raise StaleWriteError(pw.error)
 
-        # 3) 真正的整块写入，块锁保证定长、原子视图、不同块可并行
-        with self._block_locks[pw.block]:
-            # 拿锁后二次核对，防止睡眠/等锁期间发生换盘
+        # 2) 模拟落盘失败：在真正写文件之前抛错，原块内容完整保留
+        if fail:
+            pw.status = "failed"
+            pw.error = "模拟落盘失败：写入门已拒绝本次写入，镜像未被修改"
+            with self._lock:
+                self._log(
+                    "flush-fail",
+                    f"模拟落盘失败: {pw.disk_name} 块{pw.block}，原块内容保留",
+                )
+            raise SimulatedFlushError(pw.error)
+
+        return current_info
+
+    # ------------------------------------------------------ 合批协调
+    def _join_batch(
+        self, pw: PendingWrite, info: DiskInfo
+    ) -> Tuple[SyncBatch, bool]:
+        """把一条已通过预检、已持有自身块锁的写入并入同步批次。
+
+        返回 ``(批次, 是否leader)``。同盘、同挂载代次、不同块的写入并入开放
+        批次；其它情况（无开放批次/代次不符/同块）由本写入新开批次并当 leader。
+        """
+        with self._batch_cond:
+            batch = self._open_batch
+            compatible = (
+                batch is not None
+                and batch.disk_id == pw.disk_id
+                and batch.mount_generation == pw.mount_generation
+                and pw.block not in batch.joined_blocks
+            )
+            if not compatible:
+                batch = SyncBatch(
+                    batch_id=uuid.uuid4().hex[:12],
+                    disk_id=pw.disk_id,
+                    disk_name=info.name,
+                    mount_generation=pw.mount_generation,
+                    members=[pw],
+                    joined_blocks={pw.block},
+                    event=threading.Event(),
+                    sync_delay=pw.sync_delay,
+                )
+                self._open_batch = batch
+                is_leader = True
+            else:
+                batch.members.append(pw)
+                batch.joined_blocks.add(pw.block)
+                # 批次内任一成员要求的同步延时都生效（取最大值）
+                if pw.sync_delay > batch.sync_delay:
+                    batch.sync_delay = pw.sync_delay
+                is_leader = False
+
+        if is_leader:
+            # 合流窗口：等待同盘同代次、其它不同块的就绪写入并入
+            try:
+                with self._batch_cond:
+                    self._batch_cond.wait(self.batch_join_window)
+            except BaseException as exc:  # 等待被中断：收尾并唤醒已并入的成员
+                with self._batch_cond:
+                    if self._open_batch is batch:
+                        self._open_batch = None
+                if not batch.event.is_set():
+                    batch.success = False
+                    batch.error = exc
+                    for member in batch.members:
+                        member.status = "failed"
+                        member.error = f"批次同步被中断：{exc}"
+                    batch.event.set()
+                raise
+            else:
+                with self._batch_cond:
+                    if self._open_batch is batch:
+                        self._open_batch = None
+        return batch, is_leader
+
+    def _run_batch(self, batch: SyncBatch) -> None:
+        """leader 专用：写完整批块后只做一次 fsync，并唤醒全部成员。"""
+        try:
+            info = self.disks[batch.disk_id]
+
+            # 动盘前的批次级权威判定：
+            # - 槽位仍指向本批次所属盘/代次时，故障开关生效 → 整批失败、不动盘；
+            # - 槽位已换走（代次不符）时按演练约定，批次仍在原盘完成，
+            #   旧代次的其它写入由各自预检判 stale，不允许混入本批次。
+            with self._lock:
+                fail_now = self.fail_simulation
+                gen_now = self.mount_generation
+                mounted_now = self.mounted_id
+            if gen_now == batch.mount_generation and mounted_now == batch.disk_id and fail_now:
+                raise SimulatedFlushError(
+                    "模拟落盘失败：故障开关已开启，整批写入在动盘前被拒绝，镜像未被修改"
+                )
+
+            with open(self._path_for(info), "r+b") as fh:
+                for member in batch.members:
+                    fh.seek(member.block * BLOCK_SIZE)
+                    fh.write(member.payload)
+                fh.flush()
+                if batch.sync_delay:
+                    # 演练用：模拟慢速同步，方便在 fsync 前换盘/读新盘
+                    time.sleep(batch.sync_delay)
+                os.fsync(fh.fileno())  # 整批仅这一次同步
+
+            with self._lock:
+                self.fsync_total += 1
+                batch.fsync_index = self.fsync_total
+
+            for member in batch.members:
+                member.status = "done"
+                member.batch_id = batch.batch_id
+
+            batch.success = True
+            with self._lock:
+                blocks = ",".join(str(m.block) for m in batch.members)
+                self._log(
+                    "write",
+                    f"批次 {batch.batch_id}：{info.name} 块[{blocks}] 共 {batch.size} 条写入"
+                    f"合用 1 次 fsync 落盘（全局第 {batch.fsync_index} 次同步，"
+                    f"代次{batch.mount_generation}）",
+                )
+                self._record_batch(batch, "done", "")
+        except Exception as exc:  # 含 SimulatedFlushError / OSError
+            batch.success = False
+            batch.error = exc
+            message = str(exc)
+            for member in batch.members:
+                member.status = "failed"
+                member.error = message
+                member.batch_id = batch.batch_id
+            with self._lock:
+                self._log(
+                    "flush-fail",
+                    f"批次 {batch.batch_id} 整批失败（{batch.size} 条写入，"
+                    f"块{sorted(batch.joined_blocks)}），镜像未被修改：{message}",
+                )
+                self._record_batch(batch, "failed", message)
+            raise
+        finally:
+            # 无论成败都放行等待中的成员，避免挂死
+            batch.event.set()
+
+    def _flush(self, pw: PendingWrite) -> None:
+        """真正落盘的唯一入口：慢写睡眠、失效判定、失败模拟、合批 fsync。"""
+        if pw.delay:
+            time.sleep(pw.delay)
+
+        # 1) 动盘前预检：失效 / 故障（不持块锁）
+        info = self._precheck(pw)
+
+        # 2) 整块写入受 (盘,块) 锁保护：同块串行不撕裂；参与批次的块在同步
+        #    结束前一直持锁，回读必须等同步完成
+        with self._block_lock(pw.disk_id, pw.block):
+            # 拿锁后二次核对，防止睡眠/等锁期间发生换盘或拨动故障开关
             with self._lock:
                 gen2 = self.mount_generation
                 mounted2 = self.mounted_id
@@ -411,16 +636,18 @@ class DiskManager:
                     self._log("flush-fail", f"模拟落盘失败(二次核对): 块{pw.block}")
                 raise SimulatedFlushError(pw.error)
 
-            with open(self._path_for(current_info), "r+b") as fh:
-                fh.seek(pw.block * BLOCK_SIZE)
-                fh.write(pw.payload)
-                fh.flush()
-                os.fsync(fh.fileno())
+            batch, is_leader = self._join_batch(pw, info)
+            pw.batch_id = batch.batch_id
 
-        pw.status = "done"
-        with self._lock:
-            self._log(
-                "write",
-                f"落盘成功: {current_info.name} 块{pw.block} "
-                f"(代次{pw.mount_generation}, {len(pw.payload)}字节)",
-            )
+            if not is_leader:
+                # 成员：块锁仍持有，阻塞到 leader 完成整批唯一一次 fsync
+                batch.event.wait()
+                if not batch.success:
+                    # 状态/错误已由 _run_batch（或 leader 的中断收尾）统一写好
+                    if batch.error is not None:
+                        raise batch.error
+                    raise DiskError("同步批次异常结束，镜像未确认落盘")
+                return
+
+            # leader：执行合批写入与单次同步
+            self._run_batch(batch)

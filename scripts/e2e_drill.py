@@ -130,9 +130,10 @@ def main():
     _, ra = call("GET", "/api/blocks/5")
     check("旧盘块5从未被旧写入改动", not ra["result"]["data"].startswith("OLD-DISK-WRITE"))
 
-    # 3. 同盘不同块并发写入，两处改动都保留
+    # 3. 同盘不同块并发写入，两处改动都保留，且合用一次 fsync
     call("POST", "/api/gate", {"open": True})
     call("POST", "/api/slot/plug", {"disk_id": mounted})  # 确保挂 A
+    fsync_before = state()["fsync_total"]
     barrier = threading.Barrier(2)
     conc = {}
 
@@ -155,7 +156,124 @@ def main():
     check("两个不同块并发写入均返回成功", ok_status, f"耗时 {elapsed:.2f}s（含各1s慢写，并行应明显<2s）")
     check("两处改动回读均保留", both_kept)
 
-    # 3b. 同块并发不撕裂
+    wa = conc["a"][1]["result"]["write"]
+    wb = conc["b"][1]["result"]["write"]
+    fsync_after = state()["fsync_total"]
+    check(
+        "两条写入同属一个批次、合用 1 次 fsync",
+        wa["batch_id"] == wb["batch_id"] and (fsync_after - fsync_before) == 1,
+        f"batch={wa['batch_id']}，fsync {fsync_before} -> {fsync_after}",
+    )
+    last_batch = state()["batches"][0]
+    check(
+        "批次记录显示 2 个成员、状态 done",
+        last_batch["batch_id"] == wa["batch_id"] and last_batch["size"] == 2
+        and sorted(last_batch["blocks"]) == [10, 11] and last_batch["status"] == "done",
+        str(last_batch),
+    )
+
+    # 3a. 只有一条写入时也能独自落盘（单成员批次 = 1 次 fsync）
+    fsync_before = state()["fsync_total"]
+    s_status, s_body = call("POST", "/api/blocks/15/write", {"payload": payload("SOLO-E2E")})
+    fsync_after = state()["fsync_total"]
+    _, solo = call("GET", "/api/blocks/15")
+    check(
+        "单条写入独自落盘且只用 1 次 fsync",
+        s_status == 200 and (fsync_after - fsync_before) == 1
+        and solo["result"]["data"].startswith("SOLO-E2E"),
+        f"fsync {fsync_before} -> {fsync_after}",
+    )
+
+    # 3b. 同步进行中换盘：旧批次只在原盘完成，新盘同号块立即可读写
+    call("POST", "/api/slot/plug", {"disk_id": mounted})  # 确保挂 A
+    sync_box = {}
+    sync_barrier = threading.Barrier(2)
+
+    def sync_writer(key, block, text):
+        sync_barrier.wait()
+        sync_box[key] = call(
+            "POST", f"/api/blocks/{block}/write",
+            {"payload": payload(text), "sync_delay": 3, "note": "同步中换盘"},
+        )
+
+    st1 = threading.Thread(target=sync_writer, args=("a", 21, "SYNC-OLD-21"))
+    st2 = threading.Thread(target=sync_writer, args=("b", 22, "SYNC-OLD-22"))
+    st1.start(); st2.start()
+    time.sleep(1.0)  # 批次已建立，正在 fsync 前的同步延时中
+    t_plug = time.time()
+    call("POST", "/api/slot/plug", {"disk_id": other})  # 换到 B，不应被旧同步阻塞
+    plug_elapsed = time.time() - t_plug
+    check("旧盘等待同步期间换盘立即生效（不被阻塞）", plug_elapsed < 1.0, f"换盘耗时 {plug_elapsed:.2f}s")
+
+    t_read = time.time()
+    _, new_read = call("GET", "/api/blocks/21")
+    read_elapsed = time.time() - t_read
+    check(
+        "换盘后新盘同号块立即可读（另一把块锁，不被旧批次挡住）",
+        read_elapsed < 1.0 and new_read["result"]["disk_id"] == other
+        and "SYNC-OLD-21" not in new_read["result"]["data"],
+        f"读取耗时 {read_elapsed:.2f}s",
+    )
+    nw_status, _ = call("POST", "/api/blocks/21/write", {"payload": payload("SYNC-NEW-21")})
+    _, new_write_read = call("GET", "/api/blocks/21")
+    check(
+        "新盘同号块可立即写入且保留",
+        nw_status == 200 and new_write_read["result"]["data"].startswith("SYNC-NEW-21"),
+    )
+    st1.join(); st2.join()
+    check(
+        "旧批次两条写入均成功（仍在原盘 A 完成）",
+        sync_box["a"][0] == 200 and sync_box["b"][0] == 200
+        and sync_box["a"][1]["result"]["write"]["batch_id"]
+        == sync_box["b"][1]["result"]["write"]["batch_id"],
+    )
+    call("POST", "/api/slot/plug", {"disk_id": mounted})  # 换回 A
+    _, old21 = call("GET", "/api/blocks/21")
+    _, old22 = call("GET", "/api/blocks/22")
+    check(
+        "旧批次内容只落在原盘 A 的两个块上",
+        old21["result"]["data"].startswith("SYNC-OLD-21")
+        and old22["result"]["data"].startswith("SYNC-OLD-22"),
+    )
+
+    # 3c. 同块并发 + 同步中换盘：仍在等批次的旧代次写入报失效，镜像不动
+    call("POST", "/api/slot/plug", {"disk_id": mounted})  # 挂 A
+    stale_box = {}
+
+    def same_block_leader():
+        stale_box["leader"] = call(
+            "POST", "/api/blocks/23/write",
+            {"payload": payload("STALE-LEADER"), "sync_delay": 3},
+        )
+
+    def same_block_late():
+        # 稍晚发起，确保排在块锁后面等批次
+        time.sleep(0.8)
+        stale_box["late"] = call(
+            "POST", "/api/blocks/23/write", {"payload": payload("STALE-LATE")}
+        )
+
+    lt1 = threading.Thread(target=same_block_leader)
+    lt2 = threading.Thread(target=same_block_late)
+    lt1.start(); lt2.start()
+    time.sleep(1.2)
+    call("POST", "/api/slot/plug", {"disk_id": other})  # 旧写入等待期间换盘
+    lt1.join(); lt2.join()
+    check(
+        "等批次的旧代次写入报失效(HTTP 409 StaleWriteError)",
+        stale_box["late"][0] == 409 and stale_box["late"][1]["type"] == "StaleWriteError",
+        stale_box["late"][1].get("error", ""),
+    )
+    check("leader 写入在原盘成功，迟到写入报失效未落盘",
+          stale_box["leader"][0] == 200
+          and stale_box["leader"][1]["result"]["write"]["status"] == "done")
+    call("POST", "/api/slot/plug", {"disk_id": mounted})
+    _, leader_read = call("GET", "/api/blocks/23")
+    check("原盘块23只保留 leader 内容、迟到写入痕迹不存在",
+          leader_read["result"]["data"].startswith("STALE-LEADER")
+          and "STALE-LATE" not in leader_read["result"]["data"])
+
+    # 3d. 同块并发不撕裂
     barrier4 = threading.Barrier(4)
     markers = [f"MARK-{i}-" for i in range(4)]
 
@@ -194,6 +312,33 @@ def main():
     ok_status2, _ = call("POST", "/api/blocks/20/write", {"payload": payload("RECOVERED-WRITE")})
     _, recovered = call("GET", "/api/blocks/20")
     check("关闭故障注入后写入恢复正常", ok_status2 == 200 and recovered["result"]["data"].startswith("RECOVERED-WRITE"))
+
+    # 4b. 故障开关开启时，并发批次整批报错：两次 500、零 fsync、原块不变
+    fsync_before_fail = state()["fsync_total"]
+    hashes_before_batch_fail = image_hashes()
+    call("POST", "/api/fail-simulation", {"enabled": True})
+    fb = threading.Barrier(2)
+    fail_box = {}
+
+    def batch_fail_writer(key, block, text):
+        fb.wait()
+        fail_box[key] = call(
+            "POST", f"/api/blocks/{block}/write", {"payload": payload(text)}
+        )
+
+    f1 = threading.Thread(target=batch_fail_writer, args=("a", 24, "BATCH-FAIL-24"))
+    f2 = threading.Thread(target=batch_fail_writer, args=("b", 25, "BATCH-FAIL-25"))
+    f1.start(); f2.start(); f1.join(); f2.join()
+    fsync_after_fail = state()["fsync_total"]
+    check(
+        "故障开启：批次两条写入均报 500 且未产生任何 fsync",
+        fail_box["a"][0] == 500 and fail_box["b"][0] == 500
+        and fail_box["a"][1]["type"] == "SimulatedFlushError"
+        and fsync_after_fail == fsync_before_fail,
+        f"fsync {fsync_before_fail} -> {fsync_after_fail}",
+    )
+    check("整批失败后原块保持不变、镜像哈希不动", image_hashes() == hashes_before_batch_fail)
+    call("POST", "/api/fail-simulation", {"enabled": False})
 
     # 汇总
     total = len(results)

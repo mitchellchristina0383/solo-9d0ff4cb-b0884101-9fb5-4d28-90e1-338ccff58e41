@@ -12,6 +12,7 @@
     <div class="header-actions">
       <span id="gen-badge" class="badge">挂载代次: -</span>
       <span id="gate-badge" class="badge">写入门: -</span>
+      <span id="fsync-badge" class="badge">累计 fsync: -</span>
       <button id="btn-reseed" class="btn btn-warn" title="重新生成两份镜像并重置全部状态">重置演练(重新播种镜像)</button>
     </div>
   </header>
@@ -63,6 +64,9 @@
           <label>慢写延时(秒，落盘前睡眠，便于中途换盘)
             <input type="number" id="write-delay" min="0" step="0.5" value="0" />
           </label>
+          <label>同步前延时(秒，批次 fsync 前睡眠，便于“同步进行中换盘”演练)
+            <input type="number" id="write-sync-delay" min="0" step="0.5" value="0" />
+          </label>
         </div>
         <textarea id="write-payload" rows="3" maxlength="64"></textarea>
         <div class="form-row between">
@@ -90,12 +94,13 @@
 
       <!-- 并发测试 -->
       <section class="card wide">
-        <h2>⑤ 并发写入测试（同盘不同块，浏览器同时发出两个请求）</h2>
+        <h2>⑤ 并发写入测试（同盘不同块，浏览器同时发出两个请求，合用一次 fsync）</h2>
         <div class="form-row">
           <label>块 A <input type="number" id="cc-block-a" min="0" max="31" value="3" /></label>
           <label>内容 A <input type="text" id="cc-payload-a" value="CONCURRENT-A" /></label>
           <label>块 B <input type="number" id="cc-block-b" min="0" max="31" value="7" /></label>
           <label>内容 B <input type="text" id="cc-payload-b" value="CONCURRENT-B" /></label>
+          <label>同步前延时(秒) <input type="number" id="cc-sync-delay" min="0" step="0.5" value="0" /></label>
           <button id="btn-concurrent" class="btn btn-primary">同时写入两个块</button>
         </div>
         <div id="cc-result" class="readout"></div>
@@ -109,7 +114,8 @@
           <li>慢写请求返回时会报“写入失效”；对两份镜像做校验和比对，可确认没有任何一份被改动。</li>
           <li>暂停状态下对当前挂载盘写入若干块，观察写入进入排队队列；再把盘换回去，点“全部放行”，旧写入依旧失效。</li>
           <li>开启“模拟落盘失败”后发起写入，接口报 500，重新读取该块仍为原始完整内容。</li>
-          <li>用第⑤区对不同块并发写入，成功后分别读取，两处改动都应保留。</li>
+          <li>用第⑤区对不同块并发写入：两条写入会同属一个批次、合用 <b>1 次 fsync</b>，页面显示实际同步次数并在同步成功后回读两块，两处改动都应保留。</li>
+          <li>同步中换盘：第⑤区填“同步前延时”3 秒后并发写入，等待期间把盘换到另一块盘并读写新盘同号块（不受旧盘同步阻塞）；旧批次仍只在原盘完成，仍在等批次的旧代次写入报失效。</li>
         </ol>
       </section>
 

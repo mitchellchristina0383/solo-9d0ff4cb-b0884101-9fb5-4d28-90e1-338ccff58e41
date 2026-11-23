@@ -91,9 +91,12 @@ def create_app(data_dir: str | None = None) -> Flask:
         body = request.get_json(silent=True) or {}
         payload = _extract_payload(body.get("payload", ""))
         delay = float(body.get("delay", 0) or 0)
+        sync_delay = float(body.get("sync_delay", 0) or 0)
         note = str(body.get("note", ""))
         try:
-            result = manager.write_block(block, payload, delay=delay, note=note)
+            result = manager.write_block(
+                block, payload, delay=delay, note=note, sync_delay=sync_delay
+            )
         except StaleWriteError as exc:
             return err(exc, 409)
         except SimulatedFlushError as exc:
