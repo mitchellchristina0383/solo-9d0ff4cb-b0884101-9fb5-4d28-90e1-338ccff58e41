@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>虚拟机热换盘演练台</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>虚拟机热换盘演练台</h1>
+    <div class="header-actions">
+      <span id="gen-badge" class="badge">挂载代次: -</span>
+      <span id="gate-badge" class="badge">写入门: -</span>
+      <button id="btn-reseed" class="btn btn-warn" title="重新生成两份镜像并重置全部状态">重置演练(重新播种镜像)</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="grid">
+      <!-- 槽位与盘 -->
+      <section class="card">
+        <h2>① 槽位 / 插拔换盘</h2>
+        <div id="slot-info" class="slot-info">加载中…</div>
+        <h3>可用盘镜像</h3>
+        <table class="table">
+          <thead><tr><th>盘</th><th>镜像文件</th><th>ID</th><th>操作</th></tr></thead>
+          <tbody id="disk-tbody"></tbody>
+        </table>
+        <button id="btn-unplug" class="btn btn-danger">拔除当前盘(槽位置空)</button>
+      </section>
+
+      <!-- 写入门与失败模拟 -->
+      <section class="card">
+        <h2>② 写入门 / 故障注入</h2>
+        <p class="hint">暂停后，写入先进入排队队列；放行时若槽位代次已变化，旧写入报失效且不改镜像。</p>
+        <div class="btn-row">
+          <button id="btn-gate-open" class="btn btn-ok">门: 放行(open)</button>
+          <button id="btn-gate-pause" class="btn btn-warn">门: 暂停(paused)</button>
+        </div>
+        <div class="btn-row">
+          <button id="btn-fail-on" class="btn btn-danger">开启: 模拟落盘失败</button>
+          <button id="btn-fail-off" class="btn btn-ok">关闭失败模拟</button>
+        </div>
+        <div id="fail-hint" class="hint"></div>
+      </section>
+
+      <!-- 块读写 -->
+      <section class="card wide">
+        <h2>③ 定长块读写（块大小 <span id="bsize">64</span> 字节，共 <span id="bcount">32</span> 块）</h2>
+        <div class="form-row">
+          <label>块号
+            <input type="number" id="block-num" min="0" max="31" value="0" />
+          </label>
+          <button id="btn-read" class="btn">读取该块</button>
+        </div>
+        <div class="readout">
+          <div>文本视图: <code id="read-text">（未读取）</code></div>
+          <div>十六进制: <code id="read-hex" class="hex"></code></div>
+        </div>
+        <h3>写入（定长，自动补齐/截断到块大小）</h3>
+        <div class="form-row">
+          <label>慢写延时(秒，落盘前睡眠，便于中途换盘)
+            <input type="number" id="write-delay" min="0" step="0.5" value="0" />
+          </label>
+        </div>
+        <textarea id="write-payload" rows="3" maxlength="64"></textarea>
+        <div class="form-row between">
+          <span id="payload-counter" class="hint">0 / 64 字节</span>
+          <button id="btn-write" class="btn btn-primary">发起写入</button>
+        </div>
+      </section>
+
+      <!-- 排队队列 -->
+      <section class="card wide">
+        <h2>④ 暂停期间排队的写入</h2>
+        <div class="btn-row">
+          <button id="btn-release-all" class="btn btn-ok">全部放行</button>
+          <span class="hint">放行时代次不符的写入会报“失效”，不会改动任何镜像。</span>
+        </div>
+        <table class="table">
+          <thead>
+            <tr><th>ID</th><th>盘</th><th>块</th><th>代次</th><th>内容</th><th>延时</th><th>状态</th><th>操作</th></tr>
+          </thead>
+          <tbody id="pending-tbody">
+            <tr><td colspan="8" class="hint">队列为空</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- 并发测试 -->
+      <section class="card wide">
+        <h2>⑤ 并发写入测试（同盘不同块，浏览器同时发出两个请求）</h2>
+        <div class="form-row">
+          <label>块 A <input type="number" id="cc-block-a" min="0" max="31" value="3" /></label>
+          <label>内容 A <input type="text" id="cc-payload-a" value="CONCURRENT-A" /></label>
+          <label>块 B <input type="number" id="cc-block-b" min="0" max="31" value="7" /></label>
+          <label>内容 B <input type="text" id="cc-payload-b" value="CONCURRENT-B" /></label>
+          <button id="btn-concurrent" class="btn btn-primary">同时写入两个块</button>
+        </div>
+        <div id="cc-result" class="readout"></div>
+      </section>
+
+      <!-- 演练步骤 -->
+      <section class="card wide">
+        <h2>⑥ 推荐演练步骤（慢写换盘）</h2>
+        <ol class="steps">
+          <li>确认门为“放行”，对块 0 发起一个慢写（延时 5 秒），请求发出后立刻把门切到“暂停”并把盘从 A 换到 B。</li>
+          <li>慢写请求返回时会报“写入失效”；对两份镜像做校验和比对，可确认没有任何一份被改动。</li>
+          <li>暂停状态下对当前挂载盘写入若干块，观察写入进入排队队列；再把盘换回去，点“全部放行”，旧写入依旧失效。</li>
+          <li>开启“模拟落盘失败”后发起写入，接口报 500，重新读取该块仍为原始完整内容。</li>
+          <li>用第⑤区对不同块并发写入，成功后分别读取，两处改动都应保留。</li>
+        </ol>
+      </section>
+
+      <!-- 事件日志 -->
+      <section class="card wide">
+        <h2>⑦ 事件日志</h2>
+        <div id="event-log" class="event-log"></div>
+      </section>
+    </div>
+  </main>
+
+  <div id="toast-wrap"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+services:
+  hotswap-disk:
+    build: .
+    image: hotswap-disk-drill:latest
+    container_name: hotswap-disk-drill
+    ports:
+      - "8080:8080"
+    environment:
+      DISK_DATA_DIR: /data
+    volumes:
+      - disk_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/meta').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  disk_data:
